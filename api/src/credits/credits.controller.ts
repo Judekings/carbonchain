@@ -14,6 +14,8 @@ import {
   ValidationPipe,
   HttpCode,
   HttpStatus,
+  forwardRef,
+  Inject,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery } from '@nestjs/swagger';
 import { CreditsService } from './credits.service';
@@ -30,18 +32,28 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PageResult, CursorPageResult } from './credit.repository';
 import { BulkCreditsDto } from './dto/bulk-credits.dto';
 import { UseReplicaForRead } from '../common/use-replica-for-read.decorator';
+import { Idempotent } from '../common/idempotency.interceptor';
+import { RetirementService } from '../retirement/retirement.service';
+import { RetirementRequestDto } from '../retirement/dto/retire.dto';
 
 @ApiTags('credits')
 @Controller('credits')
 export class CreditsController {
-  constructor(private readonly creditsService: CreditsService) {}
+  constructor(
+    private readonly creditsService: CreditsService,
+    @Inject(forwardRef(() => RetirementService))
+    private readonly retirementService: RetirementService,
+  ) {}
 
   @ApiOperation({ summary: 'Issue a new carbon credit' })
   @ApiResponse({ status: 201, description: 'Credit issued successfully' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @UseGuards(JwtAuthGuard)
+  @Idempotent()
   @Post('issue')
-  issueCredit(@Body() dto: IssueCreditDto): Promise<{ creditId: string }> {
+  issueCredit(
+    @Body() dto: IssueCreditDto,
+  ): Promise<{ creditId: string; estimatedFeeStroops?: number }> {
     return this.creditsService.issueCredit(dto);
   }
 
@@ -85,7 +97,7 @@ export class CreditsController {
         pagination_mode: 'cursor';
       }
   > {
-    const parsedLimit = parseInt(limit, 10);
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 1, 1), 100);
 
     // Cursor-based path (preferred — O(1) at any depth)
     if (cursor !== undefined) {
@@ -101,6 +113,8 @@ export class CreditsController {
       });
     }
 
+    const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
+
     // Offset-based path (deprecated — emits warning header via service layer)
     return this.creditsService.listCredits({
       methodology,
@@ -109,7 +123,7 @@ export class CreditsController {
       status,
       minTonnes,
       maxTonnes,
-      page: parseInt(page, 10),
+      page: parsedPage,
       limit: parsedLimit,
     });
   }
@@ -184,6 +198,7 @@ export class CreditsController {
   @ApiResponse({ status: 400, description: 'Caller does not own this credit' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @UseGuards(JwtAuthGuard)
+  @Idempotent()
   @Post(':id/transfer')
   async transferCredit(
     @Param('id') creditId: string,
@@ -203,6 +218,7 @@ export class CreditsController {
   @ApiResponse({ status: 400, description: 'Caller does not own this credit' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @UseGuards(JwtAuthGuard)
+  @Idempotent()
   @Post(':id/split')
   async splitCredit(
     @Param('id') creditId: string,
@@ -361,6 +377,43 @@ export class CreditsController {
   async mergeCredits(
     @Body() dto: MergeCreditsDto,
   ): Promise<{ mergedCreditId: string; sourceCount: number }> {
-    return this.creditsService.mergeCredits(dto.callerPublicKey, dto.creditIds);
+    return this.creditsService.mergeCredits(
+      dto.callerPublicKey,
+      dto.creditIds,
+      dto.nonce,
+    );
+  }
+
+  /**
+   * ## Thin proxy — retire via credit ID route
+   *
+   * `POST /credits/:id/retire` is a convenience route that delegates directly
+   * to the **canonical** `POST /retirement` entrypoint via
+   * `RetirementService.retireCredit()`.  Both routes share the same DTO shape
+   * (`RetireDto`) and return an identical response:
+   * `{ retirementId: string; certificateIpfsHash: string }`.
+   *
+   * The buyer is bound to the authenticated principal, never taken from the body.
+   *
+   * Do NOT add independent logic here — all retire business logic lives in
+   * `RetirementService`.
+   */
+  @ApiOperation({
+    summary: '(Proxy) Retire a credit — delegates to POST /retirement',
+    description:
+      'Thin proxy for POST /retirement. Uses the same RetireDto and returns the same response shape. The credit ID from the URL is used as the creditId field.',
+  })
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/retire')
+  async retireCredit(
+    @Param('id') creditId: string,
+    @Body() body: RetirementRequestDto,
+    @Request() req: { user: { account: string } },
+  ): Promise<{ retirementId: string; certificateIpfsHash: string }> {
+    return this.retirementService.retireCredit(
+      creditId,
+      { reason: body.reason, nonce: body.nonce, tonnes: body.tonnes },
+      req.user.account,
+    );
   }
 }
