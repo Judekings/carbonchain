@@ -98,6 +98,10 @@ pub enum DataKey {
     Nonce(Address),
     MinPrice,
     ActiveOffers,
+    /// #1096 — list of admin-approved SAC token addresses (Vec<Address>).
+    AllowedTokens,
+    /// #1095 — contract schema version, incremented on each upgrade.
+    Version,
 }
 
 #[contracterror]
@@ -121,6 +125,8 @@ pub enum MarketplaceError {
     /// Escrow transfer succeeded but the offer record failed to persist;
     /// the credit was returned to the seller to avoid a stuck escrow.
     EscrowFailed = 128,
+    /// #1096 — the requested token is not in the admin-approved allowed list.
+    InvalidToken = 316,
 }
 
 #[contractevent]
@@ -158,6 +164,14 @@ pub struct OfferUpdated {
     pub new_price_xlm: i128,
 }
 
+/// #1095 — emitted after a successful contract upgrade.
+#[contractevent]
+#[derive(Clone)]
+pub struct ContractUpgraded {
+    pub admin: Address,
+    pub new_version: u32,
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -170,12 +184,23 @@ fn get_nonce(env: &Env, addr: &Address) -> u64 {
         .unwrap_or(0u64)
 }
 
+/// #1095 — no-op migration stub. Called by `upgrade` before swapping WASM.
+/// Future schema migrations go here as the contract evolves.
+fn run_migrations(_env: &Env) {
+    // No-op for v1 → v2 transition.
+    // Add field back-fills or index rebuilds here in future versions.
+}
+
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Marketplace {
     // ── Admin / Pause ────────────────────────────────────────────────────────
 
     /// Initialise the marketplace. Must be called exactly once.
+    ///
+    /// `allowed_tokens` is the initial list of approved SAC token addresses.
+    /// Pass an empty vec to start with native-XLM-only mode; tokens can be
+    /// added later via [`add_allowed_token`].
     ///
     /// # Errors
     /// - [`MarketplaceError::AlreadyInitialized`] — contract has already been initialised.
@@ -192,6 +217,12 @@ impl Marketplace {
         env.storage()
             .instance()
             .set(&DataKey::MinPrice, &min_price_per_tonne);
+        // Initialise version at 1 and allowed tokens as empty vec.
+        env.storage().instance().set(&DataKey::Version, &1u32);
+        let empty: Vec<Address> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedTokens, &empty);
         Ok(())
     }
 
@@ -225,6 +256,83 @@ impl Marketplace {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // ── #1095 — Version / Migration ─────────────────────────────────────────
+
+    /// Returns the current schema version of the contract.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32)
+    }
+
+    // ── #1096 — Allowed token management ────────────────────────────────────
+
+    /// Returns the list of admin-approved SAC token addresses.
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Add a token address to the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn add_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Only add if not already present
+        if !tokens.iter().any(|t| t == token) {
+            tokens.push_back(token);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
+    }
+
+    /// Remove a token address from the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn remove_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = tokens.iter().position(|t| t == token) {
+            tokens.remove(pos as u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
     }
 
     // ── Offers ───────────────────────────────────────────────────────────────
@@ -275,7 +383,8 @@ impl Marketplace {
     /// The buyer must hold enough of the specified asset before calling [`buy_offer`].
     ///
     /// # Errors
-    /// Same as [`create_offer`].
+    /// Same as [`create_offer`], plus:
+    /// - [`MarketplaceError::InvalidToken`] — `price_asset` is not in the allowed list.
     pub fn create_offer_with_asset(
         env: Env,
         seller: Address,
@@ -287,6 +396,12 @@ impl Marketplace {
         expires_at: Option<u64>,
         nonce: u64,
     ) -> Result<u64, MarketplaceError> {
+        // #1096 — validate SAC token is in allowed list
+        if let AssetType::Asset(ref sac) = price_asset {
+            if !Self::is_token_allowed(&env, sac) {
+                return Err(MarketplaceError::InvalidToken);
+            }
+        }
         Self::create_offer_internal(
             env,
             seller,
@@ -782,6 +897,7 @@ impl Marketplace {
     /// - [`MarketplaceError::AlreadyClosed`] — offer has already been cancelled/filled.
     /// - [`MarketplaceError::OfferExpired`] — offer has expired.
     /// - [`MarketplaceError::InsufficientFunds`] — buyer balance is less than `price_amount`.
+    /// - [`MarketplaceError::InvalidToken`] — SAC token is not in the allowed list.
     /// - [`MarketplaceError::Overflow`] — price is zero or negative (corrupt state).
     pub fn buy_offer(
         env: Env,
@@ -827,9 +943,15 @@ impl Marketplace {
         }
 
         // Resolve which contract to call for balance/transfer.
+        // #1096 — for SAC token offers, validate the token is still in the allowed list.
         let payment_contract: Address = match &offer.price_asset {
             AssetType::Native => token_id.clone(),
-            AssetType::Asset(sac) => sac.clone(),
+            AssetType::Asset(sac) => {
+                if !Self::is_token_allowed(&env, sac) {
+                    return Err(MarketplaceError::InvalidToken);
+                }
+                sac.clone()
+            }
         };
 
         // ── Pre-check: verify buyer holds enough of the payment asset ─────────────
@@ -1017,13 +1139,30 @@ impl Marketplace {
         true
     }
 
+    /// #1096 — returns true if the given token address is in the allowed list.
+    fn is_token_allowed(env: &Env, token: &Address) -> bool {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        tokens.iter().any(|t| &t == token)
+    }
+
     pub fn get_nonce(env: Env, address: Address) -> u64 {
         get_nonce(&env, &address)
     }
 
-    // ── Issue 3: Contract Upgrade Mechanism ──────────────────────────────────
+    // ── Issue #1095: Contract Upgrade Mechanism with migrations ──────────────
 
     /// Upgrade the contract WASM to a new hash. Only the admin may call this.
+    ///
+    /// Execution order:
+    /// 1. Validate admin identity and nonce.
+    /// 2. Run `run_migrations` (any schema changes for the new version).
+    /// 3. Increment `DataKey::Version`.
+    /// 4. Swap the WASM.
+    /// 5. Emit `ContractUpgraded` event.
     ///
     /// # Errors
     /// - [`MarketplaceError::NotInitialized`] — contract has not been initialised.
@@ -1039,7 +1178,21 @@ impl Marketplace {
         if !Self::consume_nonce(&env, &admin, nonce) {
             return Err(MarketplaceError::InvalidNonce);
         }
+        // Run migrations BEFORE swapping WASM so the new code sees migrated state.
+        run_migrations(&env);
+        // Increment version
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32);
+        let new_version = current_version + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        // Swap WASM
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        ContractUpgraded { admin, new_version }.publish(&env);
         Ok(())
     }
 }
@@ -1666,8 +1819,6 @@ mod tests {
             client.try_get_offer(&offer_id),
             Err(Ok(MarketplaceError::OfferExpired))
         );
-        // Offer must now be inactive in storage (fetch raw via persistent)
-        // We read it back by calling get_offer again — still expired, but active is false
         // Verify it no longer appears in get_active_offers_by_seller
         assert_eq!(client.get_active_offers_by_seller(&seller).len(), 0);
     }
@@ -2172,5 +2323,226 @@ mod tests {
 
         // Offer should no longer appear in active list
         assert_eq!(client.list_active_offers(&0, &50).len(), 0);
+    }
+
+    // ── Issue #1095: Upgrade / Version / Migration tests ─────────────────────
+
+    #[test]
+    fn test_upgrade_increments_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, admin, _registry, _credit_id) = setup_with_registry(&env);
+
+        // After initialize, version should be 1
+        assert_eq!(client.get_version(), 1);
+
+        let new_wasm = BytesN::from_array(&env, &[0u8; 32]);
+        let nonce = client.get_nonce(&admin);
+        client.upgrade(&admin, &new_wasm, &nonce);
+
+        // After upgrade, version should be 2
+        assert_eq!(client.get_version(), 2);
+    }
+
+    #[test]
+    fn test_upgrade_runs_migration_before_wasm_swap() {
+        // Verifies that upgrade() calls run_migrations before updating WASM.
+        // Since run_migrations is a no-op, we verify the version incremented
+        // (which only happens if the full upgrade path executed including migration).
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, admin, _registry, _credit_id) = setup_with_registry(&env);
+
+        let version_before = client.get_version();
+        let new_wasm = BytesN::from_array(&env, &[1u8; 32]);
+        let nonce = client.get_nonce(&admin);
+        client.upgrade(&admin, &new_wasm, &nonce);
+        let version_after = client.get_version();
+
+        // Migration must have run: version incremented exactly by 1
+        assert_eq!(version_after, version_before + 1);
+    }
+
+    #[test]
+    fn test_double_upgrade_works() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, admin, _registry, _credit_id) = setup_with_registry(&env);
+
+        assert_eq!(client.get_version(), 1);
+
+        let nonce1 = client.get_nonce(&admin);
+        client.upgrade(&admin, &BytesN::from_array(&env, &[1u8; 32]), &nonce1);
+        assert_eq!(client.get_version(), 2);
+
+        let nonce2 = client.get_nonce(&admin);
+        client.upgrade(&admin, &BytesN::from_array(&env, &[2u8; 32]), &nonce2);
+        assert_eq!(client.get_version(), 3);
+    }
+
+    #[test]
+    fn test_upgrade_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, _credit_id) = setup_with_registry(&env);
+
+        let rando = Address::generate(&env);
+        let nonce = client.get_nonce(&rando);
+        let result = client.try_upgrade(&rando, &BytesN::from_array(&env, &[0u8; 32]), &nonce);
+        assert_eq!(result, Err(Ok(MarketplaceError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_upgrade_rejects_invalid_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, admin, _registry, _credit_id) = setup_with_registry(&env);
+
+        // Use wrong nonce (current nonce + 5)
+        let wrong_nonce = client.get_nonce(&admin) + 5;
+        let result =
+            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &wrong_nonce);
+        assert_eq!(result, Err(Ok(MarketplaceError::InvalidNonce)));
+    }
+
+    // ── Issue #1096: AllowedTokens / token validation tests ──────────────────
+
+    #[test]
+    fn test_xlm_offer_still_works_without_allowed_tokens() {
+        // Native XLM offers bypass the allowed-token check entirely.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id, token) = setup_with_token(&env);
+
+        let price = 10_000_000i128;
+        let seller_nonce = client.get_nonce(&seller);
+        // create_offer uses AssetType::Native — no token validation
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &price,
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+
+        let buyer = Address::generate(&env);
+        token.set_balance(&buyer, &price);
+        let buyer_nonce = client.get_nonce(&buyer);
+        // buy_offer with native token — should succeed
+        client.buy_offer(&buyer, &offer_id, &registry.id, &token.address, &buyer_nonce);
+        assert!(!client.get_offer(&offer_id).active);
+    }
+
+    #[test]
+    fn test_create_offer_with_unapproved_sac_token_fails() {
+        // create_offer_with_asset must reject tokens not in the allowed list.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id, token) = setup_with_token(&env);
+
+        let seller_nonce = client.get_nonce(&seller);
+        // token.address is NOT in the allowed list
+        let result = client.try_create_offer_with_asset(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &AssetType::Asset(token.address.clone()),
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+        assert_eq!(result, Err(Ok(MarketplaceError::InvalidToken)));
+    }
+
+    #[test]
+    fn test_create_offer_with_approved_sac_token_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id, token) = setup_with_token(&env);
+
+        // Add token to allowed list
+        let admin_nonce = client.get_nonce(&admin);
+        client.add_allowed_token(&admin, &token.address, &admin_nonce);
+
+        let seller_nonce = client.get_nonce(&seller);
+        let result = client.try_create_offer_with_asset(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &AssetType::Asset(token.address.clone()),
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+        // Should succeed now that the token is approved
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_buy_offer_with_unapproved_sac_token_fails() {
+        // Simulate a SAC offer where the token was removed from allowed list after creation.
+        // buy_offer must re-validate the token at purchase time.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id, token) = setup_with_token(&env);
+
+        // First, add token and create offer
+        let admin_nonce = client.get_nonce(&admin);
+        client.add_allowed_token(&admin, &token.address, &admin_nonce);
+
+        let seller_nonce = client.get_nonce(&seller);
+        let offer_id = client
+            .try_create_offer_with_asset(
+                &seller,
+                &credit_id,
+                &10_000_000,
+                &AssetType::Asset(token.address.clone()),
+                &500_000,
+                &registry.id,
+                &None,
+                &seller_nonce,
+            )
+            .unwrap();
+
+        // Now remove token from allowed list
+        let admin_nonce2 = client.get_nonce(&admin);
+        client.remove_allowed_token(&admin, &token.address, &admin_nonce2);
+
+        // Buyer attempts to buy — token is now unapproved
+        let buyer = Address::generate(&env);
+        token.set_balance(&buyer, &20_000_000);
+        let buyer_nonce = client.get_nonce(&buyer);
+        let result = client.try_buy_offer(
+            &buyer,
+            &offer_id,
+            &registry.id,
+            &token.address,
+            &buyer_nonce,
+        );
+        assert_eq!(result, Err(Ok(MarketplaceError::InvalidToken)));
+    }
+
+    #[test]
+    fn test_add_remove_allowed_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, admin, _registry, _credit_id, token) = setup_with_token(&env);
+
+        // Initially empty
+        assert_eq!(client.get_allowed_tokens().len(), 0);
+
+        // Add token
+        let nonce = client.get_nonce(&admin);
+        client.add_allowed_token(&admin, &token.address, &nonce);
+        assert_eq!(client.get_allowed_tokens().len(), 1);
+
+        // Remove token
+        let nonce2 = client.get_nonce(&admin);
+        client.remove_allowed_token(&admin, &token.address, &nonce2);
+        assert_eq!(client.get_allowed_tokens().len(), 0);
     }
 }

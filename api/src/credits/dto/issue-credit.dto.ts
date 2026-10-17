@@ -10,6 +10,7 @@ import {
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsValidMethodology } from '../validators/methodology.validator';
 import { IsTonnesMultiple } from '../validators/tonnes.validator';
+import { IsValidGeography } from '../validators/geography.validator';
 import { VALID_METHODOLOGIES } from '../methodologies';
 
 export class IssueCreditDto {
@@ -47,6 +48,7 @@ export class IssueCreditDto {
   })
   @IsString()
   @IsNotEmpty()
+  @IsValidGeography({ message: 'geography must be a valid ISO 3166-1 alpha-2 country code' })
   geography: string;
 
   @ApiProperty({
